@@ -141,7 +141,7 @@ Replace `<repository-url>` with the URL of your GitHub repository.
 
 ``` bash
 git clone <repository-url>
-cd krot
+cd MapAPI
 ```
 
 If the GitHub repository uses a different directory name, enter that
