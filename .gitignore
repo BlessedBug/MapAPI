@@ -1,0 +1,35 @@
+# Python / Django
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.log
+local_settings.py
+
+# Virtual Environments
+env/
+venv/
+apienv/
+.venv/
+
+# Environment Variables / Secrets
+.env
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Note: db.sqlite3 is INTENTIONALLY NOT IGNORED here.
+# Leaving it un-ignored allows you to commit your populated database 
+# so the grader does not have to run the CSV import scripts.
