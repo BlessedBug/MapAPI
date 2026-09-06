@@ -1,129 +1,64 @@
-from django.core.management.base import BaseCommand
-from routes.models import FuelStation
+import time
 
-import geonamescache
+import requests
+from django.core.management.base import BaseCommand, CommandError
+
+from routes.models import FuelStation
 
 
 class Command(BaseCommand):
-    help = (
-        "Populate missing US fuel station coordinates using "
-        "city/state coordinates from GeoNames."
-    )
+    help = "Geocode stations individually from their address/city/state using Nominatim."
+    SEARCH_URL = "https://nominatim.openstreetmap.org/search"
+    TIMEOUT = (5, 20)
 
-    CANADIAN_PROVINCES = {
-        "AB", "BC", "MB", "NB", "NL",
-        "NS", "NT", "NU", "ON", "PE",
-        "QC", "SK", "YT",
-    }
+    def add_arguments(self, parser):
+        parser.add_argument("--limit", type=int, default=0)
+        parser.add_argument("--delay", type=float, default=1.0)
+        parser.add_argument("--user-agent", required=True)
 
     def handle(self, *args, **options):
-        self.stdout.write(
-            self.style.NOTICE(
-                "Building US city/state coordinate lookup..."
-            )
-        )
+        limit = options["limit"]
+        delay = max(0.0, options["delay"])
+        headers = {"User-Agent": options["user_agent"]}
+        stations = FuelStation.objects.filter(latitude__isnull=True).order_by("pk")
+        if limit:
+            stations = stations[:limit]
 
-        gc = geonamescache.GeonamesCache()
-        cities = gc.get_cities()
-
-        city_lookup = {}
-
-        for city in cities.values():
-            if city.get("countrycode") != "US":
-                continue
-
-            name = self.normalize(city.get("name", ""))
-            admin1 = city.get("admin1code", "")
-
-            if not name or not admin1:
-                continue
-
-            key = (name, admin1)
-
-            latitude = city.get("latitude")
-            longitude = city.get("longitude")
-
-            if latitude is None or longitude is None:
-                continue
-
-            # If multiple GeoNames entries exist for the same
-            # city/state, keep the first usable coordinate.
-            if key not in city_lookup:
-                city_lookup[key] = (
-                    float(latitude),
-                    float(longitude),
+        updated = unmatched = failed = 0
+        for station in stations.iterator() if not limit else stations:
+            query = ", ".join(part for part in [station.address, station.city, station.state, "USA"] if part)
+            try:
+                response = requests.get(
+                    self.SEARCH_URL,
+                    params={"q": query, "format": "jsonv2", "limit": 1, "countrycodes": "us"},
+                    headers=headers,
+                    timeout=self.TIMEOUT,
                 )
-
-        self.stdout.write(
-            f"US city/state coordinates available: "
-            f"{len(city_lookup)}"
-        )
-
-        stations = (
-            FuelStation.objects
-            .filter(
-                latitude__isnull=True,
-                longitude__isnull=True,
-            )
-            .exclude(
-                state__in=self.CANADIAN_PROVINCES
-            )
-        )
-
-        total = stations.count()
-
-        self.stdout.write(
-            f"US stations requiring coordinates: {total}"
-        )
-
-        updated = 0
-        unmatched = 0
-
-        for station in stations.iterator():
-            city = self.normalize(station.city)
-            state = station.state.strip().upper()
-
-            key = (city, state)
-
-            coordinates = city_lookup.get(key)
-
-            if coordinates is None:
-                unmatched += 1
+                response.raise_for_status()
+                results = response.json()
+            except (requests.RequestException, ValueError) as exc:
+                failed += 1
+                self.stderr.write(f"{station.pk}: geocoding failed: {exc}")
+                if delay:
+                    time.sleep(delay)
                 continue
 
-            latitude, longitude = coordinates
+            if not results:
+                unmatched += 1
+            else:
+                result = results[0]
+                try:
+                    station.latitude = float(result["lat"])
+                    station.longitude = float(result["lon"])
+                except (KeyError, TypeError, ValueError):
+                    unmatched += 1
+                else:
+                    station.coordinate_source = "nominatim_address"
+                    station.save(update_fields=["latitude", "longitude", "coordinate_source", "updated_at"])
+                    updated += 1
+            if delay:
+                time.sleep(delay)
 
-            FuelStation.objects.filter(
-                pk=station.pk
-            ).update(
-                latitude=latitude,
-                longitude=longitude,
-            )
-
-            updated += 1
-
-        self.stdout.write("")
-        self.stdout.write(
-            self.style.SUCCESS(
-                "Coordinate population completed."
-            )
-        )
-
-        self.stdout.write(
-            f"Updated: {updated}"
-        )
-
-        self.stdout.write(
-            f"Unmatched: {unmatched}"
-        )
-
-        self.stdout.write(
-            f"Already had coordinates: "
-            f"{FuelStation.objects.filter(latitude__isnull=False).count()}"
-        )
-
-    @staticmethod
-    def normalize(value):
-        return " ".join(
-            value.strip().lower().split()
-        )
+        self.stdout.write(self.style.SUCCESS(
+            f"Geocoding completed. Updated={updated}, unmatched={unmatched}, failed={failed}"
+        ))

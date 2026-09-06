@@ -28,7 +28,14 @@ SECRET_KEY = os.getenv("SECRET_KEY")
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.getenv("DEBUG", "False").lower() == "true"
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.getenv(
+        "ALLOWED_HOSTS",
+        "localhost,127.0.0.1,testserver"
+    ).split(",")
+    if host.strip()
+]
 
 
 # Application definition
@@ -85,6 +92,19 @@ DATABASES = {
     }
 }
 
+
+
+
+# Application cache. Local-memory is dependency-free for development; production
+# can replace this backend with Redis without changing service code.
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'fuel-route-optimizer',
+        'TIMEOUT': 60 * 60,
+        'OPTIONS': {'MAX_ENTRIES': 2000},
+    }
+}
 
 
 # Password validation

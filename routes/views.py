@@ -2,16 +2,30 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from django.http import HttpResponse
+from django.core.cache import cache
+import hashlib
+import json
 from .serializers import RouteRequestSerializer
-from .services.routing_service import get_osrm_route
+from .services.routing_service import (
+    get_osrm_route,
+    UpstreamServiceError,
+    UpstreamTimeoutError,
+    UpstreamRateLimitError,
+    LocationNotFoundError,
+)
 from .services.fuel_optimizer import optimize_fuel_stops
 from .models import FuelStation
 
 class RouteOptimizationView(APIView):
     def get(self, request):
-        # Query all unique city/state combinations from the imported CSV
-        locations = FuelStation.objects.values_list('city', 'state').distinct().order_by('state', 'city')
-        datalist_options = "".join([f'<option value="{loc[0]}, {loc[1]}">\n' for loc in locations])
+
+        datalist_options = cache.get("ui:station-location-options")
+        if datalist_options is None:
+            locations = FuelStation.objects.values_list('city', 'state').distinct().order_by('state', 'city')
+            datalist_options = "".join(
+                f'<option value="{city}, {state}">\n' for city, state in locations
+            )
+            cache.set("ui:station-location-options", datalist_options, 60 * 60)
 
         html = """
         <!DOCTYPE html>
@@ -60,6 +74,14 @@ class RouteOptimizationView(APIView):
                     <div class="input-group">
                         <label for="destination">Destination</label>
                         <input type="text" id="destination" list="us_cities" value="Dallas, TX" placeholder="Search Destination...">
+                    </div>
+                    <div class="input-group">
+                        <label for="origin_fuel_price">Origin Fuel Price ($/gal)</label>
+                        <input type="number" id="origin_fuel_price" value="3.000" min="0" step="0.001">
+                    </div>
+                    <div class="input-group">
+                        <label for="initial_fuel_gallons">Initial Fuel (gal)</label>
+                        <input type="number" id="initial_fuel_gallons" value="30" min="0" max="50" step="0.01">
                     </div>
                     <button onclick="calculate()">Find Route & Fuel Stops</button>
                     <span id="loading" style="display:none; font-weight: bold; color: #007bff;">Calculating route...</span>
@@ -140,6 +162,8 @@ class RouteOptimizationView(APIView):
                 async function calculate() {
                     const origin = document.getElementById('origin').value;
                     const destination = document.getElementById('destination').value;
+                    const origin_fuel_price = Number(document.getElementById('origin_fuel_price').value);
+                    const initial_fuel_gallons = Number(document.getElementById('initial_fuel_gallons').value);
                     const loading = document.getElementById('loading');
                     const result = document.getElementById('result');
                     const dashboard = document.getElementById('dashboard');
@@ -156,7 +180,7 @@ class RouteOptimizationView(APIView):
                         const response = await fetch('/', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ origin, destination })
+                            body: JSON.stringify({ origin, destination, origin_fuel_price, initial_fuel_gallons })
                         });
                         const data = await response.json();
                         result.textContent = JSON.stringify(data, null, 2);
@@ -227,9 +251,28 @@ class RouteOptimizationView(APIView):
         try:
             origin = serializer.validated_data['origin']
             destination = serializer.validated_data['destination']
+            origin_fuel_price = serializer.validated_data['origin_fuel_price']
+            initial_fuel_gallons = serializer.validated_data['initial_fuel_gallons']
             
+            cache_material = json.dumps({
+                "origin": origin.strip().casefold(),
+                "destination": destination.strip().casefold(),
+                "origin_fuel_price": str(origin_fuel_price),
+                "initial_fuel_gallons": float(initial_fuel_gallons),
+            }, sort_keys=True, separators=(",", ":"))
+            result_cache_key = "optimize:" + hashlib.sha256(cache_material.encode("utf-8")).hexdigest()
+            cached_response = cache.get(result_cache_key)
+            if cached_response is not None:
+                response = Response(cached_response, status=status.HTTP_200_OK)
+                response["X-Result-Cache"] = "HIT"
+                return response
+
             route_data = get_osrm_route(origin, destination)
-            fuel_plan = optimize_fuel_stops(route_data)
+            fuel_plan = optimize_fuel_stops(
+                route_data,
+                origin_fuel_price=origin_fuel_price,
+                initial_fuel_gallons=initial_fuel_gallons,
+            )
             
             response_data = {
                 "origin": origin,
@@ -245,11 +288,32 @@ class RouteOptimizationView(APIView):
                 },
                 "fuel": {
                     "gallons_used": fuel_plan['total_gallons'],
+                    "gallons_purchased": fuel_plan['gallons_purchased'],
+                    "initial_fuel_gallons": fuel_plan['initial_fuel_gallons'],
+                    "initial_fuel_used_gallons": fuel_plan['initial_fuel_used_gallons'],
+                    "initial_fuel_cost": fuel_plan['initial_fuel_cost'],
+                    "origin_fuel_price": fuel_plan['origin_fuel_price'],
                     "estimated_cost": fuel_plan['total_cost']
                 },
                 "stops": fuel_plan['stops']
             }
-            return Response(response_data, status=status.HTTP_200_OK)
+
+            cache.set(result_cache_key, response_data, 15 * 60)
+            response = Response(response_data, status=status.HTTP_200_OK)
+            response["X-Result-Cache"] = "MISS"
+            return response
             
-        except Exception as e:
-            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except LocationNotFoundError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except ValueError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except UpstreamTimeoutError:
+            return Response({"error": "An upstream service timed out."}, status=status.HTTP_504_GATEWAY_TIMEOUT)
+        except UpstreamRateLimitError:
+            return Response({"error": "An upstream service is temporarily rate limited. Please retry later."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        except UpstreamServiceError:
+            return Response({"error": "An upstream service is currently unavailable."}, status=status.HTTP_502_BAD_GATEWAY)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("Unexpected route optimization failure")
+            return Response({"error": "An internal server error occurred."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

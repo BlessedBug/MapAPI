@@ -1,5 +1,11 @@
 from django.test import TestCase
-from routes.services.cost_calculator import calculate_fuel_gallons, calculate_stop_cost, calculate_total_cost
+
+from routes.services.cost_calculator import (
+    calculate_fuel_gallons,
+    calculate_stop_cost,
+    calculate_total_cost,
+)
+
 
 class CostCalculatorTests(TestCase):
     def test_gallons_calculation(self):
